@@ -1,0 +1,13 @@
+.cursor
+.bmad-core
+.cursorignore
+.idea
+output/
+*.pyc
+__pycache__/
+*.csv
+*.log
+
+# 值清单数据目录：忽略内容，保留目录说明
+data/*
+!data/README.md
