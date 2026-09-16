@@ -172,12 +172,17 @@ class TableRenderer(object):
                 widths[i] = self.maxColumnWidth
         return widths
 
-    def _layout_widths(self, headers, rows):
+    def _layout_widths(self, headers, rows, priorities=None, min_widths=None):
         """
         列宽预算：行格式 = 2空格缩进 + 「 内容 」各列 + 「│」分隔。
         总预算 = term - 2(缩进) - 2n(列内边距) - (n-1)(分隔符) - 1(安全余量)。
-        超预算时反复收窄当前最宽的一列（不低于各列下限），保证单行不折行。
+        超预算时反复收窄一列（不低于各列下限），保证单行不折行。
         放不下（列太多/终端太窄）返回 None，调用方切换竖排视图。
+
+        priorities: 可选，与 headers 等长的「压缩优先级」列表，**值越小越先被压缩**。
+                    不传时按「当前最宽列优先」压缩（即原有行为）。
+        min_widths: 可选，与 headers 等长的「列宽下限」列表（None 表示用默认下限）。
+                    用于避免关键/短列被压到无意义的宽度（如只剩一个 …）。
         """
         n = len(headers)
         if n == 0:
@@ -191,17 +196,27 @@ class TableRenderer(object):
         for i, h in enumerate(headers):
             hw = TableRenderer.display_width(h)
             f = hw if hw < self.minColumnWidth else min(max(self.minColumnWidth, min(hw, 10)), hw)
+            if min_widths is not None and i < len(min_widths) and min_widths[i] is not None:
+                f = max(f, min_widths[i])
             floors.append(f)
         if sum(floors) > budget:
             return None
         total = sum(widths)
         while total > budget:
             best = -1
-            best_v = 0
+            best_key = None
             for i, w in enumerate(widths):
-                if w > floors[i] and w > best_v:
+                if w <= floors[i]:
+                    continue
+                if priorities is not None:
+                    prio = priorities[i] if i < len(priorities) else 0
+                else:
+                    prio = 0
+                # 先按优先级，其次按更宽的列（同优先级时均衡收缩）
+                key = (prio, -w)
+                if best_key is None or key < best_key:
+                    best_key = key
                     best = i
-                    best_v = w
             if best < 0:
                 return None
             widths[best] -= 1
@@ -209,11 +224,11 @@ class TableRenderer(object):
         return widths
 
     # -- 渲染 ------------------------------------------------------------
-    def render(self, headers, rows, title=''):
+    def render(self, headers, rows, title='', priorities=None, min_widths=None):
         if not rows:
             Tui._out(u'  ' + Tui.dim(u'· 无数据') + u'\n')
             return
-        widths = self._layout_widths(headers, rows)
+        widths = self._layout_widths(headers, rows, priorities, min_widths)
         if widths is None:
             Tui.hint(u'列数过多、终端过窄，按详情视图逐行展示')
             self.render_vertical(headers, rows)

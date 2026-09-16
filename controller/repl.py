@@ -106,8 +106,18 @@ def _first_col(row, name):
 
 
 # 表结构展示的列，以及键值的中文映射
-_STRUCT_HEADERS = (u'字段', u'类型', u'允许空', u'键', u'默认', u'注释')
+_STRUCT_HEADERS = (u'字段', u'类型', u'可空', u'键', u'默认', u'注释')
 _STRUCT_KEY_MAP = {u'PRI': u'主键', u'MUL': u'索引', u'UNI': u'唯一'}
+
+# 结构表的列宽压缩优先级：值越小越先让出宽度（字段名/类型优先保留，默认值最后让位）
+_STRUCT_SHRINK_PRIORITY = {
+    u'字段': 5, u'类型': 4, u'注释': 3, u'可空': 2, u'键': 1, u'默认': 0,
+}
+
+# 结构表各列的「最小可用宽度」：避免被压到只剩一个 …（如 主键/索引 需 4 个字宽）
+_STRUCT_MIN_WIDTHS = {
+    u'字段': 8, u'类型': 8, u'可空': 2, u'键': 4, u'默认': 4, u'注释': 8,
+}
 
 
 def _as_text(v):
@@ -141,6 +151,20 @@ def _struct_display_row(tup):
 def _struct_signature(rows):
     """结构签名：用于判断多张分表结构是否一致（可哈希比较）。"""
     return tuple(tuple(_as_text(c) for c in r) for r in rows)
+
+
+def _struct_visible_headers(disp_rows):
+    """
+    结构表要展示的列：去掉「整列全空」的列（如该表没有注释时的「注释」列），
+    把省下的宽度让给其它列；全部为空时退回完整列，避免没有可展示的内容。
+    """
+    heads = []
+    for h in _STRUCT_HEADERS:
+        for r in disp_rows:
+            if (r.get(h) or u'') != u'':
+                heads.append(h)
+                break
+    return heads or list(_STRUCT_HEADERS)
 
 
 def _ensure_field_in_fields(fields, field):
@@ -851,7 +875,10 @@ class Repl(object):
             else:
                 Tui._out(u'  ' + Tui.dim(u'取自 %s.%s' % (db, tbls[0])) + u'\n')
             disp = [_struct_display_row(r) for r in rows]
-            self.renderer.render(list(_STRUCT_HEADERS), disp)
+            heads = _struct_visible_headers(disp)
+            prios = [_STRUCT_SHRINK_PRIORITY.get(h, 0) for h in heads]
+            mins = [_STRUCT_MIN_WIDTHS.get(h) for h in heads]
+            self.renderer.render(heads, disp, priorities=prios, min_widths=mins)
 
         Tui._out(u'  ' + Tui.dim(u'提示：可复制字段名用于 SELECT 字段 / where 条件') + u'\n')
 
