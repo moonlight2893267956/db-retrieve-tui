@@ -46,6 +46,7 @@ _FULLWIDTH_MAP = {
     u'\uff0c': u',',                     # ，
     u'\uff1b': u';',                     # ；
     u'\u3002': u'.',                     # 。
+    u'\uff1f': u'?',                     # ？（用于「查看表结构」触发）
 }
 
 
@@ -102,6 +103,44 @@ def _first_col(row, name):
         if kk.lower() == want:
             return row[k]
     return None
+
+
+# 表结构展示的列，以及键值的中文映射
+_STRUCT_HEADERS = (u'字段', u'类型', u'允许空', u'键', u'默认', u'注释')
+_STRUCT_KEY_MAP = {u'PRI': u'主键', u'MUL': u'索引', u'UNI': u'唯一'}
+
+
+def _as_text(v):
+    if v is None:
+        return u''
+    if isinstance(v, bytes):
+        try:
+            return v.decode('utf-8')
+        except UnicodeDecodeError:
+            return v.decode('gbk', 'replace')
+    return u'%s' % v
+
+
+def _struct_display_row(tup):
+    """把 (field,type,nullable,key,default,comment) 转成展示用 dict（键为中文表头）。"""
+    vals = list(tup) + [None] * 6
+    field, ctype, nullable, key, default, comment = vals[:6]
+    d = _as_text(default)
+    if d.upper() == u'NULL':
+        d = u'-'
+    return {
+        _STRUCT_HEADERS[0]: _as_text(field),
+        _STRUCT_HEADERS[1]: _as_text(ctype),
+        _STRUCT_HEADERS[2]: u'是' if _as_text(nullable).upper() == u'YES' else u'否',
+        _STRUCT_HEADERS[3]: _STRUCT_KEY_MAP.get(_as_text(key).upper(), u'-'),
+        _STRUCT_HEADERS[4]: d,
+        _STRUCT_HEADERS[5]: _as_text(comment),
+    }
+
+
+def _struct_signature(rows):
+    """结构签名：用于判断多张分表结构是否一致（可哈希比较）。"""
+    return tuple(tuple(_as_text(c) for c in r) for r in rows)
 
 
 def _ensure_field_in_fields(fields, field):
@@ -343,7 +382,7 @@ class Repl(object):
             self._bulk_query_flow(db_name, targets)
             return
 
-        query = self.ask_query_parts()
+        query = self.ask_query_parts(db_name, targets)
         if query is None:
             return
 
@@ -507,7 +546,7 @@ class Repl(object):
 
         # ④ 其余查询子句（字段 / LIMIT / 高级子句）；where 由 IN 清单生成
         Tui.hint('接下来设置 SELECT 字段 / LIMIT / 排序等；where 由值清单自动生成')
-        base = self.ask_query_parts()
+        base = self.ask_query_parts(db_name, targets)
         if base is None:
             return
 
@@ -671,6 +710,165 @@ class Repl(object):
                 if schema is not None and table is not None:
                     out.append((schema, table))
         return out
+
+    # ------------------------------------------------------------------
+    # 表结构（条件屏输 `?` 查看）
+    # ------------------------------------------------------------------
+    # information_schema.columns 查询时每个 IN 批次的表数上限
+    _IS_TABLE_BATCH = 200
+
+    def fetch_table_structure(self, conn, db, tables):
+        """
+        取指定库里若干表的字段结构。
+
+        返回 {table: [(field, type, nullable, key, default, comment), ...]}
+
+        优先用 information_schema.columns 一条（分批）SQL 取齐；
+        失败时回退逐表 SHOW FULL COLUMNS。查询带 -D <db>，兼容要求先选库的分支。
+        """
+        wanted = [t for t in (tables or []) if t]
+        if not wanted:
+            return {}
+
+        result = self._query_information_schema_columns(conn, db, wanted)
+        if result is not None:
+            return result
+
+        # 回退：逐表 SHOW FULL COLUMNS
+        result = {}
+        for t in wanted:
+            result[t] = self._show_full_columns(conn, db, t)
+        return result
+
+    def _query_information_schema_columns(self, conn, db, tables):
+        """information_schema.columns 批量取字段；查询失败返回 None。"""
+        out = {}
+        batch = max(1, self._IS_TABLE_BATCH)
+        for i in range(0, len(tables), batch):
+            chunk = tables[i:i + batch]
+            in_list = ','.join("'%s'" % _escape_sql_literal(t) for t in chunk)
+            sql = ("SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, "
+                   "COLUMN_KEY, COLUMN_DEFAULT, COLUMN_COMMENT "
+                   "FROM information_schema.columns "
+                   "WHERE TABLE_SCHEMA='%s' AND TABLE_NAME IN (%s) "
+                   "ORDER BY TABLE_NAME, ORDINAL_POSITION"
+                   % (_escape_sql_literal(db), in_list))
+            try:
+                rows = self.sql.query(conn, sql, database=db)
+            except Exception:
+                return None
+            for r in rows:
+                t = _first_col(r, 'TABLE_NAME')
+                if t is None:
+                    continue
+                out.setdefault(t, []).append((
+                    _first_col(r, 'COLUMN_NAME'),
+                    _first_col(r, 'COLUMN_TYPE'),
+                    _first_col(r, 'IS_NULLABLE'),
+                    _first_col(r, 'COLUMN_KEY'),
+                    _first_col(r, 'COLUMN_DEFAULT'),
+                    _first_col(r, 'COLUMN_COMMENT'),
+                ))
+        return out
+
+    def _show_full_columns(self, conn, db, table):
+        """回退方案：SHOW FULL COLUMNS FROM db.table -> 同结构元组列表。"""
+        sql = "SHOW FULL COLUMNS FROM `%s`.`%s`" % (
+            str(db).replace('`', ''), str(table).replace('`', ''))
+        try:
+            rows = self.sql.query(conn, sql, database=db)
+        except Exception:
+            return []
+        out = []
+        for r in rows:
+            out.append((
+                _first_col(r, 'Field'),
+                _first_col(r, 'Type'),
+                _first_col(r, 'Null'),
+                _first_col(r, 'Key'),
+                _first_col(r, 'Default'),
+                _first_col(r, 'Comment'),
+            ))
+        return out
+
+    def show_table_structure(self, conn, targets):
+        """
+        展示所选表的字段结构（供条件屏输 `?` 调用）。
+
+        分片表结构一致时只展示一次并注明；不一致时逐表分段展示。
+        就地打印（不清屏），展示后由调用方重新提示原问题。
+        """
+        if not targets:
+            return
+        db = targets[0].get('dbName') or u''
+        # 只取「同一个库」下的表：分片表结构一致，用第一个库作代表即可；
+        # （库模板遍历时 targets 会跨多个库，不能把其它库的表名混进来）
+        tables = []
+        for t in targets:
+            if (t.get('dbName') or u'') != db:
+                continue
+            tn = t.get('tableName')
+            if tn and tn not in tables:
+                tables.append(tn)
+        if not tables:
+            return
+
+        Tui._out(u'\n  ' + Tui.bold(u'表结构') + u'  ' +
+                 Tui.dim(u'%s  ·  %d 张表' % (db, len(tables))) + u'\n')
+        Tui.rule()
+
+        try:
+            struct = self.fetch_table_structure(conn, db, tables)
+        except Exception as e:
+            Tui.err(u'读取表结构失败：%s' % e)
+            return
+
+        # 按结构签名分组：同结构的分表归为一组
+        groups = []          # [[signature, [tables], rows], ...]
+        for t in tables:
+            rows = struct.get(t) or []
+            if not rows:
+                continue
+            sig = _struct_signature(rows)
+            for g in groups:
+                if g[0] == sig:
+                    g[1].append(t)
+                    break
+            else:
+                groups.append([sig, [t], rows])
+
+        missing = [t for t in tables if not (struct.get(t) or [])]
+        if missing:
+            Tui.warn(u'未取到结构的表：%s' % ', '.join(missing[:5]))
+        if not groups:
+            Tui.err(u'未取到任何表结构（表可能不存在或无权限）')
+            return
+
+        for sig, tbls, rows in groups:
+            if len(tbls) > 1:
+                Tui._out(u'  ' + Tui.dim(u'%d 张表结构一致，取自 %s.%s' % (
+                    len(tbls), db, tbls[0])) + u'\n')
+            else:
+                Tui._out(u'  ' + Tui.dim(u'取自 %s.%s' % (db, tbls[0])) + u'\n')
+            disp = [_struct_display_row(r) for r in rows]
+            self.renderer.render(list(_STRUCT_HEADERS), disp)
+
+        Tui._out(u'  ' + Tui.dim(u'提示：可复制字段名用于 SELECT 字段 / where 条件') + u'\n')
+
+    def _ask_or_structure(self, prompt, default, conn, targets):
+        """
+        读取一行输入；输入 `?`（含全角 ？）时先展示表结构，再重新提示同一问题。
+        conn/targets 为空（未提供上下文）时退化为普通输入。
+        """
+        while True:
+            val = Tui.ask(prompt, default)
+            if val == SENTINEL_EOF:
+                return val
+            if conn and targets and normalize_chars(val.strip()) == u'?':
+                self.show_table_structure(conn, targets)
+                Tui._out(u'\n')
+                continue
+            return val
 
     # ------------------------------------------------------------------
     # 分组识别
@@ -882,23 +1080,29 @@ class Repl(object):
     # ------------------------------------------------------------------
     # ② 分步填查询条件：字段 → where → LIMIT →（可选）高级子句
     # ------------------------------------------------------------------
-    def ask_query_parts(self):
+    def ask_query_parts(self, conn=None, targets=None):
         """
         分步输入，各自独立提示、回车用默认：
-          1) SELECT 字段   默认 *
-          2) where 条件    默认为空（不加 where）
+          1) SELECT 字段   默认 *（可输 ? 查看表结构）
+          2) where 条件    默认为空（不加 where；可输 ? 查看表结构）
           3) LIMIT 行数    默认 100（输 NONE 不限制）
           4) 高级子句      回车跳过；输 o/g/h 可编辑 排序/分组/HAVING
         返回 QueryParts；取消返回 None。
+
+        conn/targets 提供时，「字段 / where」两处支持输 ? 就地查看所选表结构。
         """
+        # 表结构提示（仅在能取到结构上下文时显示）
+        if conn and targets:
+            Tui.hint(u'表结构：输入 ? 可查看所选表字段（类型 / 键 / 注释）')
+
         # ① 字段
-        fields = Tui.ask('SELECT 字段', '*')
+        fields = self._ask_or_structure('SELECT 字段', '*', conn, targets)
         if fields == SENTINEL_EOF:
             return None
         fields = normalize_chars(fields.strip()) or '*'
 
         # ② where
-        where = Tui.ask('where 条件（回车=不加）', '')
+        where = self._ask_or_structure('where 条件（回车=不加）', '', conn, targets)
         if where == SENTINEL_EOF:
             return None
         where = normalize_chars(where.strip())
